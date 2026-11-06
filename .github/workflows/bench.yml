@@ -1,0 +1,86 @@
+name: arm64-llama-bench
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  bench:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: calib
+        run: |
+          {
+            uname -a
+            lscpu
+            nproc
+            free -h
+            echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
+            echo "cur_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo n/a)"
+            echo "max_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo n/a)"
+            echo "date=$(date -Iseconds)"
+          } | tee calib.txt
+
+      - name: build llama.cpp
+        run: |
+          git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git lcpp
+          cd lcpp
+          git checkout cd959bae99ff4bed22bef2604f45241c09bbb8c8
+          cmake -B build -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j4 --target llama-bench
+          ./build/bin/llama-bench --version | tee -a "$GITHUB_WORKSPACE/calib.txt"
+          (cd build && grep -h -- '-march=' compile_commands.json | sort -u | head -5) | tee -a "$GITHUB_WORKSPACE/calib.txt"
+
+      - name: download model and verify sha256
+        run: |
+          python3 -m pip install -q --disable-pip-version-check huggingface_hub
+          python3 - <<'PY'
+          import hashlib, os, shutil
+          from huggingface_hub import HfApi, hf_hub_download
+          want = "dcd819ff094852c38faba6873d8ff0c9d51eadb2844539e52042ae5d647bbfdb"
+          repos = [
+              "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+              "ggml-org/Qwen2.5-1.5B-Instruct-GGUF",
+              "bartowski/Qwen2.5-1.5B-Instruct-GGUF",
+          ]
+          api = HfApi()
+          for repo in repos:
+              try:
+                  names = [s.rfilename for s in api.model_info(repo).siblings]
+              except Exception as e:
+                  print("SKIP", repo, repr(e), flush=True)
+                  continue
+              cands = [n for n in names if n.lower().endswith(".gguf") and "q4_0" in n.lower()]
+              print("CAND", repo, cands, flush=True)
+              for name in cands:
+                  try:
+                      p = hf_hub_download(repo_id=repo, filename=name, local_dir="hf")
+                  except Exception as e:
+                      print("MISS", repo, name, repr(e), flush=True)
+                      continue
+                  h = hashlib.sha256(open(p, "rb").read()).hexdigest()
+                  print("SHA", repo, name, h, flush=True)
+                  if h == want:
+                      shutil.copyfile(p, "model.gguf")
+                      print("MATCH", repo, name, flush=True)
+                      raise SystemExit(0)
+          raise SystemExit("no GGUF matched the K1 sha256")
+          PY
+          sha256sum model.gguf | tee -a calib.txt
+
+      - name: llama-bench threads 4/2/1
+        run: |
+          BIN=lcpp/build/bin/llama-bench
+          for T in 4 2 1; do
+            "$BIN" -m model.gguf -p 512 -n 128 -r 5 -ub 128 -fa on -lm none -t "$T" -o json > "arm-t${T}.json"
+            cat "arm-t${T}.json" | tee -a bench-summary.txt
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arm-bench
+          path: |
+            calib.txt
+            arm-t1.json
+            arm-t2.json
+            arm-t4.json
+            bench-summary.txt
